@@ -1,0 +1,34 @@
+# ============================================================
+#  GitHub Fork 自动同步清单
+#  格式：fork名|上游owner/repo
+#  # 开头为注释；分叉历史的仓库放在观察区，只报告不同步
+# ============================================================
+
+# ---------- 正常同步区 ----------
+Haven|GlassHaven/Haven
+rea20261024|morluto/rea
+workbuddy2api-hub|ardeyouxipianyi/workbuddy2api-hub
+workbuddy2api-panel|linguo2625469/workbuddy2api-panel
+ScrcpyForAndroid|zwc456baby/ScrcpyForAndroid
+EasyControlNext|shiyunjin/EasyControlNext
+Android-DataBackup|XayahSuSuSu/Android-DataBackup
+SyncClipboard|Jeric-X/SyncClipboard
+claw-code|ultraworkers/claw-code
+CipherTalk|cgypost/miyu
+obsidian-scribe|mikealicea/obsidian-scribe
+open-webui|open-webui/open-webui
+gemini-balance|snailyp/gemini-balance
+HybridFileXfer-_fork|weixiansen574/HybridFileXfer
+KVM-install|liyanglan/KVM-install
+x-ui|vaxilu/x-ui
+sstap|githello123/sstap
+winXray-1|xiamenhappy/winXray-1
+Actions-OpenWrt|P3TERX/Actions-OpenWrt
+kwrt-packages|mgz0227/kwrt-packages
+
+# ---------- 观察区（历史分叉/上游异常，只报告不改动）----------
+# 这些仓库自己改过配置或上游已删除，自动同步会造成冲突
+!watch|Kwrt|kiddin9/Kwrt
+!watch|immortalwrt-mt798x-6.6|padavanonly/immortalwrt-mt798x-6.6
+!watch|OpenWRT-Mediatek|NeonPulse-Zero/ZeroWrt-Mediatek
+!watch|Xray_bash_onekey|hello-yunshu/Xray_bash_onekey
