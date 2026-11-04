@@ -1,0 +1,46 @@
+name: 同步 Fork 到上游
+
+on:
+  # 每天北京时间 03:00（UTC 19:00）
+  schedule:
+    - cron: '0 19 * * *'
+  # 支持手动触发
+  workflow_dispatch:
+
+# 防止并发重复执行
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 执行同步
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          python3 sync.py
+
+      - name: 写入执行摘要
+        if: always()
+        run: |
+          echo "### 同步结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 执行时间：$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S') (北京时间)" >> $GITHUB_STEP_SUMMARY
+          echo "- 仓库清单：\`repos.txt\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "详细日志见上方 Run 输出。" >> $GITHUB_STEP_SUMMARY
