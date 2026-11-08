@@ -3,12 +3,18 @@
 """
 GitHub Fork 自动同步脚本
 读取 repos.txt，逐个调用 GitHub merge-upstream API 把 fork 同步到上游最新。
-运行环境：GitHub Actions (ubuntu-latest)，也可本地运行。
+
+核心策略：
+- fork 与上游 identical / behind → 直接快进
+- fork 与上游 diverged → 检查「领先」的提交是否全是自动产生的
+  （merge commit / chore: sync 之类），是则继续合并，否则判定需人工处理
+- 避免「同步越多次、ahead 越大、最终被自己判定停摆」的坑
 """
 import os
 import sys
 import json
 import time
+import re
 import urllib.request
 import urllib.error
 
@@ -22,6 +28,14 @@ HDR = {
     'X-GitHub-Api-Version': '2022-11-28',
 }
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# 自动产生的提交特征：命中则视为「非用户手写」，可安全继续合并
+AUTO_PATTERNS = [
+    re.compile(r'^chore:\s*sync from upstream', re.I),   # 本脚本/本地脚本产生
+    re.compile(r'^Merge (branch|remote-tracking branch|pull request)', re.I),
+    re.compile(r"^Merge branch '.*' into .*", re.I),
+    re.compile(r'^Merge .+ into .+', re.I),
+]
 
 
 def api(method, path, body=None):
@@ -66,54 +80,78 @@ def load_manifest():
     return do, watch
 
 
-def upstream_default_branch(upstream):
-    """查询上游仓库的默认分支"""
-    st, d = api('GET', '/repos/' + upstream)
-    if st == 200 and isinstance(d, dict):
-        return d.get('default_branch')
-    return None
+def is_auto_commit(msg):
+    """判断提交信息是否属于自动产生（非用户手写）"""
+    first = msg.split('\n')[0].strip()
+    return any(p.search(first) for p in AUTO_PATTERNS)
 
 
-def behind_count(upstream, up_branch, fork, fork_branch):
-    """返回 (behind, ahead, status)；查询失败返回 None"""
+def compare(upstream, up_branch, fork_branch):
+    """返回 compare 结果 dict，失败返回 None"""
     st, d = api('GET', '/repos/%s/compare/%s...%s:%s'
                 % (upstream, up_branch, OWNER, fork_branch))
     if st == 200 and isinstance(d, dict):
-        return d.get('behind_by'), d.get('ahead_by'), d.get('status')
+        return d
     return None
 
 
 def sync_one(fork, upstream):
-    """同步单个 fork，返回结果状态字符串"""
-    # 1. 查上游默认分支
-    up_branch = upstream_default_branch(upstream)
-    if not up_branch:
+    """同步单个 fork，返回 (状态, 说明)"""
+    # 1. 上游默认分支
+    st, u = api('GET', '/repos/' + upstream)
+    if st != 200 or not isinstance(u, dict):
         return 'skip', '上游仓库不存在或无法访问'
+    up_branch = u.get('default_branch')
 
-    # 2. 查 fork 的默认分支
-    st, fd = api('GET', '/repos/%s/%s' % (OWNER, fork))
-    if st != 200 or not isinstance(fd, dict):
+    # 2. fork 默认分支
+    st, f = api('GET', '/repos/%s/%s' % (OWNER, fork))
+    if st != 200 or not isinstance(f, dict):
         return 'skip', 'fork 不存在或无法访问'
-    fork_branch = fd.get('default_branch')
+    fork_branch = f.get('default_branch')
     if not fork_branch:
         return 'skip', 'fork 无默认分支'
 
-    # 3. 先比较差异
-    info = behind_count(upstream, up_branch, fork, fork_branch)
-    if info is None:
+    # 3. 比较差异
+    c = compare(upstream, up_branch, fork_branch)
+    if c is None:
         return 'skip', '无法比较（可能无共同祖先）'
-    behind, ahead, status = info
+    behind = c.get('behind_by', 0)
+    ahead = c.get('ahead_by', 0)
+    status = c.get('status')
 
     if status == 'identical' or (behind == 0 and ahead == 0):
         return 'ok', '已是最新'
     if behind == 0:
-        return 'ok', '已是最新（本地有 %d 个自有提交）' % ahead
+        return 'ok', '已是最新（本地领先 %d 个提交）' % ahead
 
-    # 4. 分叉太多则不动手，只报告
-    if status == 'diverged' and ahead > 50:
-        return 'watch', '分叉严重（落后 %d / 领先 %d），需人工处理' % (behind, ahead)
+    # 4. diverged：检查领先提交是否全为自动产生
+    if status == 'diverged' and ahead > 0:
+        commits = c.get('commits') or []
+        # compare 的 commits 是「上游有而 fork 没有」的，需另取 fork 独有提交
+        st2, fc = api('GET', '/repos/%s/compare/%s:%s...%s:%s'
+                      % (OWNER, fork_branch, upstream, up_branch))
+        # 换一种方式：直接列出 fork 分支最近提交，找出不在上游的
+        st3, recent = api('GET', '/repos/%s/commits?sha=%s&per_page=30'
+                          % (fork, fork_branch))
+        manual = []
+        if st3 == 200 and isinstance(recent, list):
+            for cm in recent:
+                sha = cm.get('sha')
+                # 该提交是否存在于上游
+                st4, _ = api('GET', '/repos/%s/commits/%s' % (upstream, sha))
+                if st4 == 200:
+                    continue  # 上游已有，跳过
+                msg = cm.get('commit', {}).get('message', '')
+                if not is_auto_commit(msg):
+                    manual.append((sha[:8], msg.split('\n')[0][:50]))
 
-    # 5. 调用 merge-upstream
+        if manual:
+            return 'watch', ('分叉：fork 上有 %d 个手写提交（如 %s），'
+                             '落后 %d 需人工处理'
+                             % (len(manual), manual[0][1], behind))
+        # 全是自动提交 → 继续合并
+
+    # 5. 执行 merge-upstream
     st, d = api('POST', '/repos/%s/%s/merge-upstream' % (OWNER, fork),
                 {'branch': fork_branch})
     if st == 200 and isinstance(d, dict):
@@ -125,9 +163,9 @@ def sync_one(fork, upstream):
         return 'watch', '存在冲突，需人工解决（落后 %d / 领先 %d）' % (behind, ahead)
     if st == 422:
         msg = d.get('message', '') if isinstance(d, dict) else str(d)
-        return 'watch', '被拒绝：%s' % msg[:100]
+        return 'watch', '被拒绝：%s' % str(msg)[:100]
     msg = d.get('message', '') if isinstance(d, dict) else str(d)
-    return 'fail', 'HTTP %s：%s' % (st, msg[:100])
+    return 'fail', 'HTTP %s：%s' % (st, str(msg)[:100])
 
 
 def main():
@@ -154,36 +192,34 @@ def main():
         results[status].append((fork, msg))
         time.sleep(1)
 
-    # 观察区只查差异
+    # 观察区只报告
     if watch_list:
         print('\n' + '-' * 62)
         print('👀 观察区（不做任何改动）')
         print('-' * 62)
         for fork, upstream in watch_list:
-            up_branch = upstream_default_branch(upstream)
-            if not up_branch:
+            st, u = api('GET', '/repos/' + upstream)
+            if st != 200 or not isinstance(u, dict):
                 print('  ⚠️ %-24s 上游不存在' % fork)
                 continue
-            st, fd = api('GET', '/repos/%s/%s' % (OWNER, fork))
-            if st != 200 or not isinstance(fd, dict):
+            st, f = api('GET', '/repos/%s/%s' % (OWNER, fork))
+            if st != 200 or not isinstance(f, dict):
                 print('  ⚠️ %-24s fork 无法访问' % fork)
                 continue
-            info = behind_count(upstream, up_branch, fork, fd.get('default_branch'))
-            if info is None:
+            c = compare(upstream, u.get('default_branch'), f.get('default_branch'))
+            if c is None:
                 print('  ⚠️ %-24s 无法比较（无共同祖先）' % fork)
             else:
-                b, a, s = info
-                print('  👀 %-24s 落后 %-6s 领先 %-6s %s' % (fork, b, a, s))
+                print('  👀 %-24s 落后 %-6s 领先 %-6s %s'
+                      % (fork, c.get('behind_by'), c.get('ahead_by'), c.get('status')))
             time.sleep(0.8)
 
-    # 汇总
     print('\n' + '=' * 62)
     print('📊 汇总：成功 %d | 跳过 %d | 需人工 %d | 失败 %d'
           % (len(results['ok']), len(results['skip']),
              len(results['watch']), len(results['fail'])))
     print('=' * 62)
 
-    # 有失败则退出码非 0，让 Actions 标红
     if results['fail']:
         sys.exit(1)
 
