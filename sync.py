@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GitHub Fork 自动同步脚本（全自动发现版）
+GitHub Fork 自动同步脚本（自动发现版 · 安全加固）
 
 工作方式：
-1. 调用 API 拉取 mojinhai 名下所有仓库
-2. 筛选出所有 fork，并逐个查询其上游 parent 仓库
-3. 排除 skip.txt 里列出的仓库（黑名单）
-4. 对剩余 fork 逐个执行 merge-upstream 同步
+1. 拉取 mojinhai 名下所有仓库
+2. 【安全第1层】跳过所有私有仓库（private=True），绝不触碰
+3. 【安全第2层】跳过非 fork 仓库（fork=False），自己建的不动
+4. 【安全第3层】跳过 skip.txt 黑名单里的仓库
+5. 对剩余 fork 逐个执行 merge-upstream 同步
 
-你新 fork 任何项目，脚本第二天会自动发现并同步，无需手动维护清单。
+你新 fork 任何公开项目，第二天会自动发现并同步。
+你自己新建的、私有的项目永远安全。
 """
 import os
 import sys
@@ -38,12 +40,12 @@ AUTO_PATTERNS = [
     re.compile(r'^Merge .+ into .+', re.I),
 ]
 
-# 默认跳过名单（即使写在 skip.txt 里也会叠加）
+# 默认跳过名单（与 skip.txt 叠加）
 DEFAULT_SKIP = {
-    'Kwrt',                    # 自己改过配置，分叉严重
-    'immortalwrt-mt798x-6.6',  # 自建分支，非标准 fork 关系
-    'OpenWRT-Mediatek',        # 上游仓库已删除
-    'Xray_bash_onekey',        # 与上游无共同祖先
+    'Kwrt',
+    'immortalwrt-mt798x-6.6',
+    'OpenWRT-Mediatek',
+    'Xray_bash_onekey',
 }
 
 
@@ -85,8 +87,12 @@ def load_skip():
 
 
 def discover_forks():
-    """自动发现所有 fork，返回 [(fork名, 上游owner/repo, 默认分支)]"""
-    found = []
+    """
+    自动发现所有可同步的 fork。
+    返回 (候选列表, 私有仓库名列表, 非fork仓库名列表)
+    候选列表元素：(fork名, 上游owner/repo, 默认分支)
+    """
+    found, privates, non_forks = [], [], []
     page = 1
     while True:
         st, repos = api('GET', '/user/repos?per_page=100&page=%d'
@@ -97,12 +103,30 @@ def discover_forks():
         if not repos:
             break
         for r in repos:
-            if not r.get('fork'):
-                continue
             name = r.get('name')
-            # 列表接口不返回 parent，必须单独查
+
+            # ── 安全第1层：私有仓库直接跳过，绝不查询、绝不修改 ──
+            if r.get('private'):
+                privates.append(name)
+                continue
+
+            # ── 安全第2层：非 fork 仓库跳过（自己建的） ──
+            if not r.get('fork'):
+                non_forks.append(name)
+                continue
+
+            # 是公开 fork，查上游 parent
             st2, d = api('GET', '/repos/%s/%s' % (OWNER, name))
             if st2 != 200 or not isinstance(d, dict):
+                continue
+            # 再次确认：即便拿到详情，私有也绝不处理
+            if d.get('private'):
+                if name not in privates:
+                    privates.append(name)
+                continue
+            if not d.get('fork'):
+                if name not in non_forks:
+                    non_forks.append(name)
                 continue
             parent = (d.get('parent') or {}).get('full_name')
             if not parent:
@@ -112,7 +136,7 @@ def discover_forks():
         if len(repos) < 100:
             break
         page += 1
-    return found
+    return found, privates, non_forks
 
 
 def is_auto_commit(msg):
@@ -135,12 +159,12 @@ def has_manual_commits(fork, fork_branch, upstream):
     st, recent = api('GET', '/repos/%s/commits?sha=%s&per_page=30'
                      % (fork, fork_branch))
     if st != 200 or not isinstance(recent, list):
-        return None  # 查询失败，未知
+        return None
     for cm in recent:
         sha = cm.get('sha')
         st2, _ = api('GET', '/repos/%s/commits/%s' % (upstream, sha))
         if st2 == 200:
-            continue  # 上游已有此提交
+            continue
         msg = cm.get('commit', {}).get('message', '')
         if not is_auto_commit(msg):
             return msg.split('\n')[0][:50]
@@ -168,12 +192,10 @@ def sync_one(fork, upstream, fork_branch):
     if behind == 0:
         return 'ok', '已是最新（本地领先 %d 个提交）' % ahead
 
-    # 分叉状态：检查是否有手写提交
     if status == 'diverged' and ahead > 0:
         manual = has_manual_commits(fork, fork_branch, upstream)
         if manual:
-            return 'watch', ('有手写提交（%s），落后 %d 需人工处理'
-                             % (manual, behind))
+            return 'watch', '有手写提交（%s），落后 %d 需人工处理' % (manual, behind)
 
     st, d = api('POST', '/repos/%s/%s/merge-upstream' % (OWNER, fork),
                 {'branch': fork_branch})
@@ -196,23 +218,32 @@ def main():
         print('❌ 缺少 SYNC_TOKEN 环境变量')
         sys.exit(1)
 
-    print('=' * 62)
-    print('GitHub Fork 自动同步（自动发现模式）')
-    print('=' * 62)
+    print('=' * 64)
+    print('GitHub Fork 自动同步（自动发现 · 已启用私有仓库保护）')
+    print('=' * 64)
 
-    print('\n🔍 正在扫描你的仓库...')
-    all_forks = discover_forks()
-    print('   发现 %d 个 fork' % len(all_forks))
+    print('\n🔍 扫描仓库中...')
+    all_forks, privates, non_forks = discover_forks()
+    print('   可同步的公开 fork：%d 个' % len(all_forks))
+    print('   🔒 私有仓库（已保护，绝不触碰）：%d 个' % len(privates))
+    if privates:
+        for p in privates:
+            print('      - %s' % p)
+    print('   🏠 自己建的公开仓库（不动）：%d 个' % len(non_forks))
+    if non_forks:
+        for p in non_forks:
+            print('      - %s' % p)
 
     skip = load_skip()
     do_list, watch_list = [], []
-    for name, parent, branch in all_forks:
-        if name in skip:
-            watch_list.append((name, parent, branch))
+    for item in all_forks:
+        if item[0] in skip:
+            watch_list.append(item)
         else:
-            do_list.append((name, parent, branch))
+            do_list.append(item)
 
-    print('   待同步 %d 个，跳过 %d 个' % (len(do_list), len(watch_list)))
+    print('\n   实际同步：%d 个 | 黑名单跳过：%d 个'
+          % (len(do_list), len(watch_list)))
 
     results = {'ok': [], 'skip': [], 'watch': [], 'fail': []}
 
@@ -228,13 +259,13 @@ def main():
         time.sleep(1)
 
     if watch_list:
-        print('\n' + '-' * 62)
-        print('👀 跳过名单（不做改动）')
-        print('-' * 62)
+        print('\n' + '-' * 64)
+        print('👀 黑名单（不做任何改动）')
+        print('-' * 64)
         for fork, upstream, branch in watch_list:
             st, u = api('GET', '/repos/' + upstream)
             if st != 200 or not isinstance(u, dict):
-                print('  ⚠️ %-24s 上游已不存在' % fork)
+                print('  ⛔ %-24s 无上游（已删库/封号），保持原样' % fork)
                 continue
             c = compare(upstream, u.get('default_branch'), branch)
             if c is None:
@@ -244,11 +275,12 @@ def main():
                       % (fork, c.get('behind_by'), c.get('ahead_by')))
             time.sleep(0.6)
 
-    print('\n' + '=' * 62)
+    print('\n' + '=' * 64)
     print('📊 汇总：成功 %d | 跳过 %d | 需人工 %d | 失败 %d'
           % (len(results['ok']), len(results['skip']),
              len(results['watch']), len(results['fail'])))
-    print('=' * 62)
+    print('🔒 私有仓库保护：%d 个已排除，未被触碰' % len(privates))
+    print('=' * 64)
 
     if results['fail']:
         sys.exit(1)
